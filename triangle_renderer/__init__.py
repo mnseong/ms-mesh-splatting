@@ -176,21 +176,17 @@ def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor, 
         enable_top2=enable_top2  # NEW PARAMETER
     )
     
+    rendered_image = raster_result["render"]
+    radii = raster_result["radii"]
+    scaling = raster_result["scaling"]
+    allmap = raster_result["depth"]
+    max_blending = raster_result["max_blending"]
+    was_rendered = raster_result["was_rendered"]
+
     if enable_top2:
-        # New format: dictionary return
-        rendered_image = raster_result["render"]
-        radii = raster_result["radii"]
-        scaling = raster_result["scaling"] 
-        allmap = raster_result["depth"]
-        max_blending = raster_result["max_blending"]
-        was_rendered = raster_result["was_rendered"]
-        # NEW: Top-2 data
         top2_ids = raster_result["top2_ids"]
         top2_depths = raster_result["top2_depths"]
         top2_weights = raster_result["top2_weights"]
-    else:
-        # Original format: tuple return for backward compatibility
-        rendered_image, radii, scaling, allmap, max_blending, was_rendered = raster_result
 
     radii = radii[:vertex_index]
     scaling = scaling[:vertex_index]
