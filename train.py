@@ -56,17 +56,49 @@ except:
 from utils.render_utils import generate_path, create_videos
 
 
+class Top2LayerLoss(torch.nn.Module):
+    """
+    Layered depth separation loss using top-2 triangle contributions
+    """
+    def __init__(self, depth_margin=0.1, weight_threshold=0.01):
+        super().__init__()
+        self.depth_margin = depth_margin
+        self.weight_threshold = weight_threshold
+    
+    def forward(self, top2_result):
+        if not top2_result:
+            return torch.tensor(0.0, device="cuda")
+            
+        top2_ids = top2_result["top2_ids"]         # [2, H, W]
+        top2_depths = top2_result["top2_depths"]   # [2, H, W]  
+        top2_weights = top2_result["top2_weights"] # [2, H, W]
+        
+        # Get layer data
+        layer1_depths = top2_depths[0]  # [H, W] - best layer
+        layer2_depths = top2_depths[1]  # [H, W] - second best layer
+        
+        # Valid pixels: both layers exist and meet weight threshold
+        valid_mask = (
+            (top2_ids[0] != -1) & 
+            (top2_ids[1] != -1) & 
+            (top2_weights[0] > self.weight_threshold) &
+            (top2_weights[1] > self.weight_threshold)
+        )
+        
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device="cuda")
+        
+        # LAYERED DEPTH SEPARATION LOSS
+        # Encourage front layer (layer1) to be closer than back layer (layer2)
+        depth_violation = layer2_depths - layer1_depths + self.depth_margin
+        depth_loss = F.relu(depth_violation)[valid_mask].mean()
+        
+        return depth_loss
 
-def training(
-        dataset,   
-        opt, 
-        pipe,
-        testing_iterations,
-        checkpoint, 
-        debug_from,
-        scene_name,
-        use_sparse_adam=False
-        ):
+def training(dataset, opt, pipe, testing_iterations, checkpoint, debug_from, scene_name,
+            use_sparse_adam=False, 
+            enable_top2_loss=False,
+            top2_loss_weight=0.1):
     
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -78,6 +110,11 @@ def training(
 
     triangles.training_setup(opt, opt.feature_lr, opt.weight_lr, opt.lr_triangles_points_init)
     triangles.add_percentage = opt.add_percentage
+    
+    top2_loss_fn = None
+    if enable_top2_loss:
+        top2_loss_fn = Top2LayerLoss(depth_margin=0.05, weight_threshold=0.01)
+        print(f"Top-2 layer loss enabled with weight {top2_loss_weight}")
 
 
     if checkpoint:
@@ -162,7 +199,7 @@ def training(
                 triangles.importance_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda") # reset to 0 to ensure that everything is deleted with an importance score of 0
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        render_pkg = render(viewpoint_cam, triangles, pipe, bg)
+        render_pkg = render(viewpoint_cam, triangles, pipe, bg, enable_top2=enable_top2_loss)
         image = render_pkg["render"]
 
         # Loss
@@ -199,6 +236,10 @@ def training(
 
         # FINAL LOSS
         loss = loss_image
+        
+        if enable_top2_loss and "top2_result" in render_pkg:
+            top2_loss_value = top2_loss_fn(render_pkg["top2_result"])
+            loss += top2_loss_weight * top2_loss_value
 
         # Opacity loss
         Lweight_pure = 0.0
@@ -492,6 +533,9 @@ if __name__ == "__main__":
     parser.add_argument('--scene_name', default="Garden", type=str)
     parser.add_argument("--use_sparse_adam", action="store_true", default=True)
     parser.add_argument("--indoor", action="store_true", default=False)
+    
+    parser.add_argument("--enable_top2_loss", action="store_true", default=False)
+    parser.add_argument("--top2_loss_weight", type=float, default=0.1)
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

@@ -100,7 +100,8 @@ def compute_image_2d_pytorch_exact(vertices, projmatrix, W, H):
     return image_2D_pytorch
 
 
-def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, enable_top2 = False):
+
     """
     Render the scene. 
     
@@ -164,7 +165,7 @@ def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible triangles to image, obtain their radii (on screen). 
-    rendered_image, radii, scaling, allmap, max_blending, was_rendered  = rasterizer(
+    raster_result = rasterizer(
         vertices=vertices,
         triangles_indices=triangles_indices,
         vertex_weights=vertex_weights.squeeze(),
@@ -172,7 +173,24 @@ def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor, 
         shs = shs,
         colors_precomp = colors_precomp,
         scaling = scaling,
-       )
+        enable_top2=enable_top2  # NEW PARAMETER
+    )
+    
+    if enable_top2:
+        # New format: dictionary return
+        rendered_image = raster_result["render"]
+        radii = raster_result["radii"]
+        scaling = raster_result["scaling"] 
+        allmap = raster_result["depth"]
+        max_blending = raster_result["max_blending"]
+        was_rendered = raster_result["was_rendered"]
+        # NEW: Top-2 data
+        top2_ids = raster_result["top2_ids"]
+        top2_depths = raster_result["top2_depths"]
+        top2_weights = raster_result["top2_weights"]
+    else:
+        # Original format: tuple return for backward compatibility
+        rendered_image, radii, scaling, allmap, max_blending, was_rendered = raster_result
 
     radii = radii[:vertex_index]
     scaling = scaling[:vertex_index]
@@ -203,6 +221,13 @@ def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor, 
             "render_normal_full": allmap[2:5],
             "triangle_was_rendered": was_rendered
             }
+    
+    if enable_top2:
+        rets["top2_result"] = {
+            "top2_ids": top2_ids,       # [2, H, W]
+            "top2_depths": top2_depths, # [2, H, W] 
+            "top2_weights": top2_weights # [2, H, W]
+        }
 
     # additional regularizations
     render_alpha = allmap[1:2]
