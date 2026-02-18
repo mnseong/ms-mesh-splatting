@@ -36,6 +36,7 @@ def rasterize_triangles(
     colors_precomp,
     scaling,
     raster_settings,
+    enable_top2=False  # NEW PARAMETER
 ):
     return _RasterizeTriangles.apply(
         vertices,
@@ -46,6 +47,7 @@ def rasterize_triangles(
         colors_precomp,
         scaling,
         raster_settings,
+        enable_top2
     )
 
 class _RasterizeTriangles(torch.autograd.Function):
@@ -60,6 +62,7 @@ class _RasterizeTriangles(torch.autograd.Function):
         colors_precomp,
         scaling,
         raster_settings,
+        enable_top2=False  # NEW PARAMETER
     ):
 
         # Restructure arguments the way that the C++ lib expects them
@@ -81,31 +84,42 @@ class _RasterizeTriangles(torch.autograd.Function):
             raster_settings.sh_degree,
             raster_settings.campos,
             raster_settings.prefiltered,
-            raster_settings.debug
+            raster_settings.debug,
+            enable_top2  # NEW ARGUMENT
         )
-
 
         # Invoke C++/CUDA rasterizer
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                num_rendered, color, depth, radii, was_rendered, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending = _C.rasterize_triangles(*args)
+                num_rendered, color, depth, radii, was_rendered, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending, top2_ids, top2_depths, top2_weights = _C.rasterize_triangles(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, color, depth, radii, was_rendered, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending = _C.rasterize_triangles(*args)
+            num_rendered, color, depth, radii, was_rendered, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending, top2_ids, top2_depths, top2_weights = _C.rasterize_triangles(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.sigma = sigma
+        ctx.enable_top2 = enable_top2
         ctx.save_for_backward(vertices, triangles_indices, vertex_weights, colors_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
-        return color, radii, scaling, depth, max_blending, was_rendered
+        
+        # Return results with optional top-2 tensors
+        if enable_top2:
+            return color, radii, scaling, depth, max_blending, was_rendered, top2_ids, top2_depths, top2_weights
+        else:
+            return color, radii, scaling, depth, max_blending, was_rendered
 
     @staticmethod
-    def backward(ctx, grad_out_color, _, __, grad_depth, _____, _______):
+    def backward(ctx, grad_out_color, _, __, grad_depth, _____, _______, *args):
+        # Handle optional top-2 gradients
+        if ctx.enable_top2:
+            # Top-2 gradients are provided but we don't use them for backward pass yet
+            grad_top2_ids, grad_top2_depths, grad_top2_weights = args[:3]
+            # Currently we ignore top-2 gradients as they're for analysis, not training
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -113,7 +127,7 @@ class _RasterizeTriangles(torch.autograd.Function):
         sigma = ctx.sigma
         vertices, triangles_indices, vertex_weights, colors_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
 
-        # Restructure args as C++ method expects them
+        # Restructure args as C++ method expects them (unchanged)
         args = (raster_settings.bg,
                 vertices,
                 triangles_indices,
@@ -148,7 +162,6 @@ class _RasterizeTriangles(torch.autograd.Function):
         else:
              grad_vertices, grad_vertice_weights, grad_colors_precomp, grad_sh = _C.rasterize_triangles_backward(*args)
 
-
         grads = (
             grad_vertices,  
             None,  # triangles_indices
@@ -157,7 +170,8 @@ class _RasterizeTriangles(torch.autograd.Function):
             grad_sh,
             grad_colors_precomp,
             None,
-            None
+            None,
+            None   # enable_top2
         )
 
         return grads
@@ -192,7 +206,7 @@ class TriangleRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, vertices, triangles_indices, vertex_weights, sigma, scaling,  shs = None, colors_precomp = None):
+    def forward(self, vertices, triangles_indices, vertex_weights, sigma, scaling, shs=None, colors_precomp=None, enable_top2=False):
         
         raster_settings = self.raster_settings
 
@@ -204,9 +218,8 @@ class TriangleRasterizer(nn.Module):
         if colors_precomp is None:
             colors_precomp = torch.Tensor([])
 
-
         # Invoke C++/CUDA rasterization routine
-        return rasterize_triangles(
+        result = rasterize_triangles(
             vertices,
             triangles_indices,
             vertex_weights,
@@ -214,8 +227,31 @@ class TriangleRasterizer(nn.Module):
             shs,
             colors_precomp,
             scaling,
-            raster_settings, 
+            raster_settings,
+            enable_top2
         )
+        
+        if enable_top2:
+            return {
+                "render": result[0],
+                "radii": result[1], 
+                "scaling": result[2],
+                "depth": result[3],
+                "max_blending": result[4],
+                "was_rendered": result[5],
+                "top2_ids": result[6],
+                "top2_depths": result[7],
+                "top2_weights": result[8]
+            }
+        else:
+            return {
+                "render": result[0],
+                "radii": result[1],
+                "scaling": result[2], 
+                "depth": result[3],
+                "max_blending": result[4],
+                "was_rendered": result[5]
+            }
 
 
 class SparseGaussianAdam(torch.optim.Adam):

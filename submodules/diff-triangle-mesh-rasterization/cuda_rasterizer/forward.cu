@@ -417,198 +417,264 @@
  // block, each thread treats one pixel. Alternates between fetching 
  // and rasterizing data.
  template <uint32_t CHANNELS>
- __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
- renderCUDA(
-	 const uint2* __restrict__ ranges,
-	 const uint32_t* __restrict__ point_list,
-	 int W, int H,
-	 const float2* __restrict__ normals,
-	 const float* __restrict__ offsets,
-	 const float2* __restrict__ points_xy_image,
-	 const float* __restrict__ vertex_depth, 
-	 const int* __restrict__ triangles_indices,
-	 const float sigma,
-	 const float* __restrict__ features,
-	 const float4* __restrict__ conic_opacity,
-	 const float* __restrict__ depths,
-	 const float2* __restrict__ phi_center,
-	 const float2* __restrict__ p_image,
-	 float* __restrict__ final_T,
-	 uint32_t* __restrict__ n_contrib,
-	 const float* __restrict__ bg_color,
-	 float* __restrict__ out_color,
-	 float* __restrict__ out_others,
-	 float* __restrict__ max_blending,
-	 int* __restrict__ was_rendered)
- {
-	 // Identify current tile and associated min/max pixel range.
-	 auto block = cg::this_thread_block();
-	 uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	 uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	 uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-	 uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-	 uint32_t pix_id = W * pix.y + pix.x;
-	 float2 pixf = { (float)pix.x, (float)pix.y };
- 
-	 // Check if this thread is associated with a valid pixel or outside.
-	 bool inside = pix.x < W&& pix.y < H;
-	 // Done threads can help with fetching, but don't rasterize
-	 bool done = !inside;
- 
-	 // Load start/end range of IDs to process in bit sorted list.
-	 uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
-	 const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
-	 int toDo = range.y - range.x;
- 
-	 // Allocate storage for batches of collectively fetched data.
-	 __shared__ int collected_id[BLOCK_SIZE];
-	 __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
- 
-	 /*
-	 ADDED FOR TRIANGLE PURPOSES ==========================================================================
-	 */
-	 __shared__ float2 collected_normals[BLOCK_SIZE * MAX_NB_POINTS];
-	 __shared__ float collected_offsets[BLOCK_SIZE * MAX_NB_POINTS];
-	 __shared__ float collected_depths[BLOCK_SIZE];
-	 __shared__ float2 collected_xy[BLOCK_SIZE];
-	 __shared__ float2 collected_phi_center[BLOCK_SIZE];
-	 __shared__ float2 collected_p_images[BLOCK_SIZE * MAX_NB_POINTS];
-	 /*
-	 ===================================================================================================
-	 */
- 
-	 // Initialize helper variables
-	 float T = 1.0f;
-	 uint32_t contributor = 0;
-	 uint32_t last_contributor = 0;
-	 float C[CHANNELS] = { 0 };
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float2* __restrict__ normals,
+	const float* __restrict__ offsets,
+	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ vertex_depth, 
+	const int* __restrict__ triangles_indices,
+	const float sigma,
+	const float* __restrict__ features,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ depths,
+	const float2* __restrict__ phi_center,
+	const float2* __restrict__ p_image,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ bg_color,
+	float* __restrict__ out_color,
+	float* __restrict__ out_others,
+	float* __restrict__ max_blending,
+	int* __restrict__ was_rendered,
+	// NEW TOP-2 PARAMETERS
+	int* __restrict__ top2_ids = nullptr,
+	float* __restrict__ top2_depths = nullptr,
+	float* __restrict__ top2_weights = nullptr,
+	bool enable_top2 = false)
+{
+	// Identify current tile and associated min/max pixel range.
+	auto block = cg::this_thread_block();
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	uint32_t pix_id = W * pix.y + pix.x;
+	float2 pixf = { (float)pix.x, (float)pix.y };
 
-	 // Added from 2DGS
-	 float N[3] = {0};
-	 float D = { 0 };
-	 float M1 = {0};
-	 float M2 = {0};
-	 float distortion = {0};
-	 float median_depth = {0};
-	 float median_contributor = {-1};
+	// Check if this thread is associated with a valid pixel or outside.
+	bool inside = pix.x < W&& pix.y < H;
+	// Done threads can help with fetching, but don't rasterize
+	bool done = !inside;
 
-	 int pixel_influence;
- 
-	 // Iterate over batches until all done or range is complete
-	 for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
-	 {
-		 // End if entire block votes that it is done rasterizing
-		 int num_done = __syncthreads_count(done);
-		 if (num_done == BLOCK_SIZE)
-			 break;
- 
-		 // Collectively fetch per-Triangle data from global to shared
-		 int progress = i * BLOCK_SIZE + block.thread_rank();
-		 if (range.x + progress < range.y)
-		 {
-			 int coll_id = point_list[range.x + progress];
-			 collected_id[block.thread_rank()] = coll_id;
-			 collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			 collected_depths[block.thread_rank()] = depths[coll_id];
-			 collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			 for (int k = 0; k < 3; k++) {
+	// Load start/end range of IDs to process in bit sorted list.
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int toDo = range.y - range.x;
+
+	// Allocate storage for batches of collectively fetched data.
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	/*
+	ADDED FOR TRIANGLE PURPOSES ==========================================================================
+	*/
+	__shared__ float2 collected_normals[BLOCK_SIZE * MAX_NB_POINTS];
+	__shared__ float collected_offsets[BLOCK_SIZE * MAX_NB_POINTS];
+	__shared__ float collected_depths[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float2 collected_phi_center[BLOCK_SIZE];
+	__shared__ float2 collected_p_images[BLOCK_SIZE * MAX_NB_POINTS];
+	/*
+	===================================================================================================
+	*/
+
+	// Initialize helper variables
+	float T = 1.0f;
+	uint32_t contributor = 0;
+	uint32_t last_contributor = 0;
+	float C[CHANNELS] = { 0 };
+
+	// Added from 2DGS
+	float N[3] = {0};
+	float D = { 0 };
+	float M1 = {0};
+	float M2 = {0};
+	float distortion = {0};
+	float median_depth = {0};
+	float median_contributor = {-1};
+
+	// TOP-2 TRACKING VARIABLES
+	float best1_w = 0.0f, best1_d = 0.0f;
+	int best1_id = -1;
+	float best2_w = 0.0f, best2_d = 0.0f;
+	int best2_id = -1;
+
+	int pixel_influence;
+
+	// Iterate over batches until all done or range is complete
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		// End if entire block votes that it is done rasterizing
+		int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		// Collectively fetch per-Triangle data from global to shared
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_depths[block.thread_rank()] = depths[coll_id];
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			for (int k = 0; k < 3; k++) {
 				collected_normals[MAX_NB_POINTS * block.thread_rank() + k] = normals[3 * coll_id + k];
 				collected_offsets[MAX_NB_POINTS * block.thread_rank() + k] = offsets[3 * coll_id + k];;
 				collected_p_images[MAX_NB_POINTS * block.thread_rank() + k] = p_image[3 * coll_id + k];
 			}
 			collected_phi_center[block.thread_rank()] = phi_center[coll_id];
-		 }
-		 block.sync();
- 
-		 // Iterate over current batch
-		 for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
-		 {
-			 // Keep track of current position in range
-			 contributor++;
- 
-			 int j_id = collected_id[j];
-			 float4 con_o = collected_conic_opacity[j];
-			 float normal[3] = {con_o.x, con_o.y, con_o.z};
-			 float2 phi_center_min = collected_phi_center[j];
-			 float max_val = -INFINITY;
-			 int base = j * MAX_NB_POINTS;
-			 bool outside = false;
+		}
+		block.sync();
 
-			 for (int k = 0; k < 3; k++) {
-				 // Compute the current distance
-				 float dist = (collected_normals[base + k].x * pixf.x
-						  + collected_normals[base + k].y * pixf.y
-						  + collected_offsets[base + k]);
+		// Iterate over current batch
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			// Keep track of current position in range
+			contributor++;
 
-				 if (dist > 0) {
+			int j_id = collected_id[j];
+			float4 con_o = collected_conic_opacity[j];
+			float normal[3] = {con_o.x, con_o.y, con_o.z};
+			float2 phi_center_min = collected_phi_center[j];
+			float max_val = -INFINITY;
+			int base = j * MAX_NB_POINTS;
+			bool outside = false;
+
+			for (int k = 0; k < 3; k++) {
+				// Compute the current distance
+				float dist = (collected_normals[base + k].x * pixf.x
+						+ collected_normals[base + k].y * pixf.y
+						+ collected_offsets[base + k]);
+
+				if (dist > 0) {
 					outside = true;
 					break;
-				 }
- 
-				 max_val = fmaxf(max_val, dist);
-			 }
+				}
 
-			 if (outside)
+				max_val = fmaxf(max_val, dist);
+			}
+
+			if (outside)
 				continue;
- 
-			 float phi_x = max_val;
-			 float phi_final = phi_x * phi_center_min.x;
-			 float Cx = fmaxf(0.0f,  __powf(phi_final, sigma));
- 
-			 float alpha = min(0.999f, con_o.w * Cx); 
-			 if (alpha < 1.0f / 255.0f)
-				 continue;
+
+			float phi_x = max_val;
+			float phi_final = phi_x * phi_center_min.x;
+			float Cx = fmaxf(0.0f,  __powf(phi_final, sigma));
+
+			float alpha = min(0.999f, con_o.w * Cx); 
+			if (alpha < 1.0f / 255.0f)
+				continue;
 			
-			 atomicAdd(was_rendered + j_id, 1);
+			atomicAdd(was_rendered + j_id, 1);
 
-			 float test_T = T * (1 - alpha);
-			 if (test_T < 0.0001f)
-			 {
-				 done = true;
-				 continue;
-			 }
-			 
-			 float blending_weight = alpha * T;
-			 // Update the maximum blending weight in a thread-safe way
-			 atomicMax(((int*)max_blending) + j_id, *((int*)(&blending_weight)));
-
-			 // COLOR INTERPOLATION
-
-			 // Interpolate the colors
-			 float2 uv0 = collected_p_images[j * 3 + 0];
-			 float2 uv1 = collected_p_images[j * 3 + 1];
-			 float2 uv2 = collected_p_images[j * 3 + 2];
-
-			 // vectors along the edges from uv0
-			 float2 v0 = { uv1.x - uv0.x, uv1.y - uv0.y };
-			 float2 v1 = { uv2.x - uv0.x, uv2.y - uv0.y };
-			 // vector from uv0 to pixel
-			 float2 v2 = { pixf.x  - uv0.x, pixf.y  - uv0.y };
-
-			 // invert the 2×2 [v0 v1] matrix
-			 float denom  = v0.x * v1.y - v1.x * v0.y;
-			 float invDen = 1.0f / denom;    // assume non-degenerate
-
-			 // barycentrics relative to uv0,uv1,uv2
-			 float b0 = ( v2.x * v1.y - v1.x * v2.y) * invDen;
-			 float b1 = (-v2.x * v0.y + v0.x * v2.y) * invDen;
-			 float b2 = 1.0f - b0 - b1;
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
 			
-			 int aux = 3 * j_id;
-			 int vertex_idx0 = triangles_indices[aux];
-			 int vertex_idx1 = triangles_indices[aux + 1];
-			 int vertex_idx2 = triangles_indices[aux + 2];
+			float blending_weight = alpha * T;
+			// Update the maximum blending weight in a thread-safe way
+			atomicMax(((int*)max_blending) + j_id, *((int*)(&blending_weight)));
 
-			 float depth_vertex_0 =  vertex_depth[vertex_idx0];
-			 float depth_vertex_1 =  vertex_depth[vertex_idx1];
-			 float depth_vertex_2 =  vertex_depth[vertex_idx2];
+			// TOP-2 TRACKING UPDATE
+			if (enable_top2) {
+				// Compute depth interpolation for this triangle contribution
+				float2 uv0 = collected_p_images[j * 3 + 0];
+				float2 uv1 = collected_p_images[j * 3 + 1];
+				float2 uv2 = collected_p_images[j * 3 + 2];
 
-			 float wA = b2;    // vertex0
-			 float wB = b0;    // vertex1
-			 float wC = b1;    // vertex2
+				// vectors along the edges from uv0
+				float2 v0 = { uv1.x - uv0.x, uv1.y - uv0.y };
+				float2 v1 = { uv2.x - uv0.x, uv2.y - uv0.y };
+				// vector from uv0 to pixel
+				float2 v2 = { pixf.x  - uv0.x, pixf.y  - uv0.y };
 
-			 // now blend them
-			 for (int ch = 0; ch < CHANNELS; ++ch) {
+				// invert the 2×2 [v0 v1] matrix
+				float denom  = v0.x * v1.y - v1.x * v0.y;
+				float invDen = 1.0f / denom;    // assume non-degenerate
+
+				// barycentrics relative to uv0,uv1,uv2
+				float b0 = ( v2.x * v1.y - v1.x * v2.y) * invDen;
+				float b1 = (-v2.x * v0.y + v0.x * v2.y) * invDen;
+				float b2 = 1.0f - b0 - b1;
+			
+				int aux = 3 * j_id;
+				int vertex_idx0 = triangles_indices[aux];
+				int vertex_idx1 = triangles_indices[aux + 1];
+				int vertex_idx2 = triangles_indices[aux + 2];
+
+				float depth_vertex_0 =  vertex_depth[vertex_idx0];
+				float depth_vertex_1 =  vertex_depth[vertex_idx1];
+				float depth_vertex_2 =  vertex_depth[vertex_idx2];
+
+				float wA = b2;    // vertex0
+				float wB = b0;    // vertex1
+				float wC = b1;    // vertex2
+
+				float depth_interp = wA * depth_vertex_0 + wB * depth_vertex_1 + wC * depth_vertex_2;
+
+				// Update top-2 tracking
+				if (blending_weight > best1_w) {
+					// New best1, move old best1 to best2
+					best2_w = best1_w;
+					best2_d = best1_d;
+					best2_id = best1_id;
+					
+					best1_w = blending_weight;
+					best1_d = depth_interp;
+					best1_id = j_id;
+				} else if (blending_weight > best2_w) {
+					// New best2
+					best2_w = blending_weight;
+					best2_d = depth_interp;
+					best2_id = j_id;
+				}
+			}
+
+			// COLOR INTERPOLATION (unchanged)
+
+			// Interpolate the colors
+			float2 uv0 = collected_p_images[j * 3 + 0];
+			float2 uv1 = collected_p_images[j * 3 + 1];
+			float2 uv2 = collected_p_images[j * 3 + 2];
+
+			// vectors along the edges from uv0
+			float2 v0 = { uv1.x - uv0.x, uv1.y - uv0.y };
+			float2 v1 = { uv2.x - uv0.x, uv2.y - uv0.y };
+			// vector from uv0 to pixel
+			float2 v2 = { pixf.x  - uv0.x, pixf.y  - uv0.y };
+
+			// invert the 2×2 [v0 v1] matrix
+			float denom  = v0.x * v1.y - v1.x * v0.y;
+			float invDen = 1.0f / denom;    // assume non-degenerate
+
+			// barycentrics relative to uv0,uv1,uv2
+			float b0 = ( v2.x * v1.y - v1.x * v2.y) * invDen;
+			float b1 = (-v2.x * v0.y + v0.x * v2.y) * invDen;
+			float b2 = 1.0f - b0 - b1;
+		
+			int aux = 3 * j_id;
+			int vertex_idx0 = triangles_indices[aux];
+			int vertex_idx1 = triangles_indices[aux + 1];
+			int vertex_idx2 = triangles_indices[aux + 2];
+
+			float depth_vertex_0 =  vertex_depth[vertex_idx0];
+			float depth_vertex_1 =  vertex_depth[vertex_idx1];
+			float depth_vertex_2 =  vertex_depth[vertex_idx2];
+
+			float wA = b2;    // vertex0
+			float wB = b0;    // vertex1
+			float wC = b1;    // vertex2
+
+			// now blend them
+			for (int ch = 0; ch < CHANNELS; ++ch) {
 				// Access colors per vertex (not per triangle)
 				float c0 = features[vertex_idx0 * CHANNELS + ch];
 				float c1 = features[vertex_idx1 * CHANNELS + ch];
@@ -616,30 +682,30 @@
 
 				float interp = wA * c0 + wB * c1 + wC * c2;
 				C[ch] += interp * alpha * T;
-			 } 
+			} 
 
-			 float depth_interp = wA * depth_vertex_0 + wB * depth_vertex_1 + wC * depth_vertex_2;
+			float depth_interp = wA * depth_vertex_0 + wB * depth_vertex_1 + wC * depth_vertex_2;
 
-			 D  += depth_interp * blending_weight;
- 
-			 if (T > 0.5) {
-				 median_depth = depth_interp;
-				 median_contributor = contributor;
-				 pixel_influence = j_id;
-			 }
-			 // Render normal map
-			 for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * blending_weight;
- 
-			 T = test_T;
- 
-			 last_contributor = contributor;
-		 }
-	 }
- 
-	 // All threads that treat valid pixel write out their final
-	 // rendering data to the frame and auxiliary buffers.
-	 if (inside)
-	 {	
+			D  += depth_interp * blending_weight;
+
+			if (T > 0.5) {
+				median_depth = depth_interp;
+				median_contributor = contributor;
+				pixel_influence = j_id;
+			}
+			// Render normal map
+			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * blending_weight;
+
+			T = test_T;
+
+			last_contributor = contributor;
+		}
+	}
+
+	// All threads that treat valid pixel write out their final
+	// rendering data to the frame and auxiliary buffers.
+	if (inside)
+	{	
 		out_others[pix_id + 0 * H * W] = last_contributor;
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
@@ -652,57 +718,79 @@
 		for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
 		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
 		out_others[pix_id + DISTORTION_OFFSET * H * W] = pixel_influence;
-	 }
- }
- 
- void FORWARD::render(
-	 const dim3 grid, dim3 block,
-	 const uint2* ranges,
-	 const uint32_t* point_list,
-	 int W, int H,
-	 const float2* normals,
-	 const float* offsets,
-	 const float2* points_xy_image,
-	 const float* vertex_depth, 
-	 const int* triangles_indices,
-	 const float sigma,
-	 const float* colors,
-	 const float4* conic_opacity,
-	 const float* depths,
-	 const float2* phi_center,
-	 const float2* p_image,
-	 float* final_T,
-	 uint32_t* n_contrib,
-	 const float* bg_color,
-	 float* out_color,
-	 float* out_others,
+
+		// WRITE TOP-2 DATA
+		if (enable_top2) {
+			// Layer 1 (best)
+			top2_ids[pix_id] = best1_id;
+			top2_depths[pix_id] = best1_d;
+			top2_weights[pix_id] = best1_w;
+			
+			// Layer 2 (second best)
+			top2_ids[pix_id + H * W] = best2_id;
+			top2_depths[pix_id + H * W] = best2_d;
+			top2_weights[pix_id + H * W] = best2_w;
+		}
+	}
+}
+
+void FORWARD::render(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	const float2* normals,
+	const float* offsets,
+	const float2* points_xy_image,
+	const float* vertex_depth, 
+	const int* triangles_indices,
+	const float sigma,
+	const float* colors,
+	const float4* conic_opacity,
+	const float* depths,
+	const float2* phi_center,
+	const float2* p_image,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* bg_color,
+	float* out_color,
+	float* out_others,
 	float* max_blending,
-	int* was_rendered)
- {
-	 renderCUDA<NUM_CHANNELS> << <grid, block >> > (
-		 ranges,
-		 point_list,
-		 W, H,
-		 normals,
-		 offsets,
-		 points_xy_image,
-		 vertex_depth,
-		 triangles_indices,
-		 sigma,
-		 colors,
-		 conic_opacity,
-		 depths,
-		 phi_center,
-		 p_image,
-		 final_T,
-		 n_contrib,
-		 bg_color,
-		 out_color,
-		 out_others,
-		 max_blending,
-		 was_rendered
-		 );
- }
+	int* was_rendered,
+	// NEW TOP-2 PARAMETERS
+	int* top2_ids,
+	float* top2_depths,
+	float* top2_weights,
+	bool enable_top2)
+{
+	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+		ranges,
+		point_list,
+		W, H,
+		normals,
+		offsets,
+		points_xy_image,
+		vertex_depth,
+		triangles_indices,
+		sigma,
+		colors,
+		conic_opacity,
+		depths,
+		phi_center,
+		p_image,
+		final_T,
+		n_contrib,
+		bg_color,
+		out_color,
+		out_others,
+		max_blending,
+		was_rendered,
+		top2_ids,
+		top2_depths,
+		top2_weights,
+		enable_top2
+		);
+}
 
 
  // Add this to the FORWARD namespace implementation

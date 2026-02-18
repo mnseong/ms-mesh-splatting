@@ -45,7 +45,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizetrianglesCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& vertices,
@@ -64,7 +64,8 @@ RasterizetrianglesCUDA(
 	const int degree,
 	const torch::Tensor& campos,
 	const bool prefiltered,
-	const bool debug)
+	const bool debug,
+	const bool enable_top2)  // NEW PARAMETER
 {
     
   const int P = triangles_indices.size(0);
@@ -92,6 +93,17 @@ RasterizetrianglesCUDA(
 
   torch::Tensor out_others = torch::full({3+3+1, H, W}, 0.0, float_opts);
   torch::Tensor max_blending = torch::full({P}, 0.0, float_opts);
+
+  // TOP-2 BUFFERS (created conditionally)
+  torch::Tensor top2_ids = torch::empty({0}, int_opts);
+  torch::Tensor top2_depths = torch::empty({0}, float_opts);
+  torch::Tensor top2_weights = torch::empty({0}, float_opts);
+
+  if (enable_top2) {
+	top2_ids = torch::full({2, H, W}, -1, int_opts);
+	top2_depths = torch::zeros({2, H, W}, float_opts);
+	top2_weights = torch::zeros({2, H, W}, float_opts);
+  }
 
   const int total_nb_points = P * 3; // FOR EACH TRIANGLE, WE CAN HAVE 3 NORMALS, OFFSETS,...
   
@@ -130,9 +142,12 @@ RasterizetrianglesCUDA(
 		max_blending.contiguous().data_ptr<float>(),
 		radii.contiguous().data_ptr<int>(),
 		was_rendered.contiguous().data_ptr<int>(),
+		enable_top2 ? top2_ids.contiguous().data_ptr<int>() : nullptr,
+		enable_top2 ? top2_depths.contiguous().data_ptr<float>() : nullptr,
+		enable_top2 ? top2_weights.contiguous().data_ptr<float>() : nullptr,
 		debug);
   }
-  return std::make_tuple(rendered, out_color, out_others, radii, was_rendered, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending);
+  return std::make_tuple(rendered, out_color, out_others, radii, was_rendered, geomBuffer, binningBuffer, imgBuffer, scaling, max_blending, top2_ids, top2_depths, top2_weights);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

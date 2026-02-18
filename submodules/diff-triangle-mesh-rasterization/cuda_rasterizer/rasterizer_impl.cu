@@ -215,92 +215,95 @@
  // Forward rendering procedure for differentiable rasterization
  // of triangles.
  int CudaRasterizer::Rasterizer::forward(
-	 std::function<char* (size_t)> geometryBuffer,
-	 std::function<char* (size_t)> binningBuffer,
-	 std::function<char* (size_t)> imageBuffer,
-	 const int P, const int V, int D, int M,
-	 const float* background,
-	 const int width, int height,
-	 const float* vertices,
-	 const int* triangles_indices,
-	 const float* vertex_weights,
-	 const float sigma,
-	 const int total_nb_points,
-	 const float* shs,
-	 const float* colors_precomp,
-	 float* scaling,
-	 const float* viewmatrix,
-	 const float* projmatrix,
-	 const float* cam_pos,
-	 const float tan_fovx, float tan_fovy,
-	 const bool prefiltered,
-	 float* out_color,
-	 float* out_others,
-	 float* max_blending,
-	 int* radii,
-	 int* was_rendered,
-	 bool debug)
- {
-	 const float focal_y = height / (2.0f * tan_fovy);
-	 const float focal_x = width / (2.0f * tan_fovx);
- 
-	 size_t chunk_size = required<GeometryState>(P, total_nb_points, V);
-	 char* chunkptr = geometryBuffer(chunk_size);
-	 GeometryState geomState = GeometryState::fromChunk(chunkptr, P, total_nb_points, V); 
-	 
-	 if (radii == nullptr)
-	 {
-		 radii = geomState.internal_radii;
-	 }
- 
-	 dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-	 dim3 block(BLOCK_X, BLOCK_Y, 1);
- 
-	 // Dynamically resize image-based auxiliary buffers during training
-	 size_t img_chunk_size = required<ImageState>(width * height);
-	 char* img_chunkptr = imageBuffer(img_chunk_size);
-	 ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
- 
-	 if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
-	 {
-		 throw std::runtime_error("For non-RGB, provide precomputed Triangle colors!");
-	 }
- 
-	 // Run preprocessing per-Triangle (transformation, bounding, conversion of SHs to RGB)
-	 CHECK_CUDA(FORWARD::preprocess(
-		 P, D, M,
-		 vertices,
-		 triangles_indices,
-		 vertex_weights,
-		 sigma,
-		 scaling,
-		 shs,
-		 geomState.clamped,
-		 colors_precomp,
-		 viewmatrix, projmatrix,
-		 (glm::vec3*)cam_pos,
-		 width, height,
-		 focal_x, focal_y,
-		 tan_fovx, tan_fovy,
-		 radii,
-		 geomState.normals,
-		 geomState.offsets,
-		 geomState.p_w,
-		 geomState.p_image,
-		 geomState.indices,
-		 geomState.means2D,
-		 geomState.depths,
-		 geomState.conic_opacity,
-		 geomState.phi_center,
-		 geomState.rect_min,
-		 geomState.rect_max,
-		 tile_grid,
-		 geomState.tiles_touched,
-		 prefiltered
-	 ), debug)
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	const int P, const int V, int D, int M,
+	const float* background,
+	const int width, int height,
+	const float* vertices,
+	const int* triangles_indices,
+	const float* vertex_weights,
+	const float sigma,
+	const int total_nb_points,
+	const float* shs,
+	const float* colors_precomp,
+	float* scaling,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float* cam_pos,
+	const float tan_fovx, float tan_fovy,
+	const bool prefiltered,
+	float* out_color,
+	float* out_others,
+	float* max_blending,
+	int* radii,
+	int* was_rendered,
+	// NEW TOP-2 PARAMETERS
+	int* top2_ids,
+	float* top2_depths,
+	float* top2_weights,
+	bool debug)
+{
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
 
+	size_t chunk_size = required<GeometryState>(P, total_nb_points, V);
+	char* chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P, total_nb_points, V); 
+	
+	if (radii == nullptr)
+	{
+		radii = geomState.internal_radii;
+	}
 
-	 if (colors_precomp == nullptr)
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	// Dynamically resize image-based auxiliary buffers during training
+	size_t img_chunk_size = required<ImageState>(width * height);
+	char* img_chunkptr = imageBuffer(img_chunk_size);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+
+	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
+	{
+		throw std::runtime_error("For non-RGB, provide precomputed Triangle colors!");
+	}
+
+	// Run preprocessing per-Triangle (transformation, bounding, conversion of SHs to RGB)
+	CHECK_CUDA(FORWARD::preprocess(
+		P, D, M,
+		vertices,
+		triangles_indices,
+		vertex_weights,
+		sigma,
+		scaling,
+		shs,
+		geomState.clamped,
+		colors_precomp,
+		viewmatrix, projmatrix,
+		(glm::vec3*)cam_pos,
+		width, height,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		radii,
+		geomState.normals,
+		geomState.offsets,
+		geomState.p_w,
+		geomState.p_image,
+		geomState.indices,
+		geomState.means2D,
+		geomState.depths,
+		geomState.conic_opacity,
+		geomState.phi_center,
+		geomState.rect_min,
+		geomState.rect_max,
+		tile_grid,
+		geomState.tiles_touched,
+		prefiltered
+	), debug)
+
+	if (colors_precomp == nullptr)
 	{
 		// Compute vertex colors in parallel
 		FORWARD::computeVertexColors(
@@ -314,83 +317,92 @@
 			(glm::vec3*)cam_pos
 		);
 	}
- 
-	 // Compute prefix sum over full list of touched tile counts by triangles
-	 // E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-	 CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
- 
-	 // Retrieve total number of Triangle instances to launch and resize aux buffers
-	 int num_rendered;
-	 CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
- 
-	 size_t binning_chunk_size = required<BinningState>(num_rendered);
-	 char* binning_chunkptr = binningBuffer(binning_chunk_size);
-	 BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
- 
-	 // For each instance to be rendered, produce adequate [ tile | depth ] key 
-	 // and corresponding dublicated Triangle indices to be sorted
-	 duplicateWithKeys << <(P + 255) / 256, 256 >> > (
-		 P,
-		 geomState.means2D,
-		 geomState.depths,
-		 geomState.point_offsets,
-		 geomState.p_image,
-		 geomState.rect_min,
-		 geomState.rect_max,
-		 binningState.point_list_keys_unsorted,
-		 binningState.point_list_unsorted,
-		 radii,
-		 tile_grid)
-	 CHECK_CUDA(, debug)
- 
-	 int bit = getHigherMsb(tile_grid.x * tile_grid.y);
- 
-	 // Sort complete list of (duplicated) Triangle indices by keys
-	 CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
-		 binningState.list_sorting_space,
-		 binningState.sorting_size,
-		 binningState.point_list_keys_unsorted, binningState.point_list_keys,
-		 binningState.point_list_unsorted, binningState.point_list,
-		 num_rendered, 0, 32 + bit), debug)
- 
-	 CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
- 
-	 // Identify start and end of per-tile workloads in sorted list
-	 if (num_rendered > 0)
-		 identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
-			 num_rendered,
-			 binningState.point_list_keys,
-			 imgState.ranges);
-	 CHECK_CUDA(, debug)
- 
-	 // Let each tile blend its range of triangles independently in parallel
-	 const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
-	 CHECK_CUDA(FORWARD::render(
-		 tile_grid, block,
-		 imgState.ranges,
-		 binningState.point_list,
-		 width, height,
-		 geomState.normals,
-		 geomState.offsets,
-		 geomState.means2D,
-		 geomState.vertex_depth,
-		 triangles_indices,
-		 sigma,
-		 feature_ptr,
-		 geomState.conic_opacity,
-		 geomState.depths,
-		 geomState.phi_center,
-		 geomState.p_image,
-		 imgState.accum_alpha,
-		 imgState.n_contrib,
-		 background,
-		 out_color,
-		 out_others,
-		 max_blending,
-		 was_rendered), debug)
- 
-	 return num_rendered;
- }
+
+	// Compute prefix sum over full list of touched tile counts by triangles
+	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+
+	// Retrieve total number of Triangle instances to launch and resize aux buffers
+	int num_rendered;
+	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+
+	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	// For each instance to be rendered, produce adequate [ tile | depth ] key 
+	// and corresponding dublicated Triangle indices to be sorted
+	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+		P,
+		geomState.means2D,
+		geomState.depths,
+		geomState.point_offsets,
+		geomState.p_image,
+		geomState.rect_min,
+		geomState.rect_max,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		tile_grid)
+	CHECK_CUDA(, debug)
+
+	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+
+	// Sort complete list of (duplicated) Triangle indices by keys
+	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space,
+		binningState.sorting_size,
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,
+		binningState.point_list_unsorted, binningState.point_list,
+		num_rendered, 0, 32 + bit), debug)
+
+	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+
+	// Identify start and end of per-tile workloads in sorted list
+	if (num_rendered > 0)
+		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+			num_rendered,
+			binningState.point_list_keys,
+			imgState.ranges);
+	CHECK_CUDA(, debug)
+
+	// Let each tile blend its range of triangles independently in parallel
+	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	
+	// Check if top-2 is enabled
+	bool enable_top2 = (top2_ids != nullptr && top2_depths != nullptr && top2_weights != nullptr);
+	
+	CHECK_CUDA(FORWARD::render(
+		tile_grid, block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		geomState.normals,
+		geomState.offsets,
+		geomState.means2D,
+		geomState.vertex_depth,
+		triangles_indices,
+		sigma,
+		feature_ptr,
+		geomState.conic_opacity,
+		geomState.depths,
+		geomState.phi_center,
+		geomState.p_image,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		background,
+		out_color,
+		out_others,
+		max_blending,
+		was_rendered,
+		top2_ids,
+		top2_depths, 
+		top2_weights,
+		enable_top2), debug)
+
+	return num_rendered;
+}
+
  
  // Produce necessary gradients for optimization, corresponding
  // to forward render pass

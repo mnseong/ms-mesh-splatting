@@ -1,28 +1,9 @@
 /*
- * The original code is under the following copyright:
- * Copyright (C) 2023, Inria
- * GRAPHDECO research group, https://team.inria.fr/graphdeco
- * All rights reserved.
- *
- * This software is free for non-commercial, research and evaluation use 
- * under the terms of the LICENSE_GS.md file.
- *
- * For inquiries contact  george.drettakis@inria.fr
- * 
- * The modifications of the code are under the following copyright:
- * Copyright (C) 2024, University of Liege, KAUST and University of Oxford
- * TELIM research group, http://www.telecom.ulg.ac.be/
- * IVUL research group, https://ivul.kaust.edu.sa/
- * VGG research group, https://www.robots.ox.ac.uk/~vgg/
- * All rights reserved.
- * The modifications are under the LICENSE.md file.
- *
- * For inquiries contact jan.held@uliege.be
+ * Modified rasterizer.h with top-2 layer support
  */
 
 #ifndef CUDA_RASTERIZER_H_INCLUDED
 #define CUDA_RASTERIZER_H_INCLUDED
-
 #include <vector>
 #include <functional>
 
@@ -31,14 +12,13 @@ namespace CudaRasterizer
 	class Rasterizer
 	{
 	public:
-
 		static void markVisible(
 			int P,
 			float* means3D,
 			float* viewmatrix,
 			float* projmatrix,
 			bool* present);
-
+			
 		static int forward(
 			std::function<char* (size_t)> geometryBuffer,
 			std::function<char* (size_t)> binningBuffer,
@@ -64,8 +44,12 @@ namespace CudaRasterizer
 			float* max_blending,
 			int* radii = nullptr,
 			int* was_rendered = nullptr,
+			// NEW TOP-2 PARAMETERS
+			int* top2_ids = nullptr,
+			float* top2_depths = nullptr,
+			float* top2_weights = nullptr,
 			bool debug = false);
-
+			
 		static void backward(
 			const int P, const int V, int D, int M, int R,
 			const float* background,
